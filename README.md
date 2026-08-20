@@ -38,8 +38,17 @@ cache-heavy RAG-style workloads, benchmark with `--speculative-config` removed f
 ## Files
 
 - `serve-qwen38-mtp.sh` — the launch script (sanitized: paths/API key via env vars)
-- `patches/vllm-pr50021-wheel-only.patch` — **required** patch, vllm-source hunks only
-- `patches/vllm-pr50021-gdn-spec-bounds.patch` — full upstream PR diff (incl. tests)
+- `patches/vllm-pr50021-gdn-spec-bounds.patch` — **required** patch, exactly what our
+  production server runs (verified byte-identical against the live install)
+- `patches/vllm-pr50021-full-pr.diff` — complete upstream PR diff for reference
+
+The required patch is the **GDN-relevant subset** of
+[vllm-project/vllm#50021](https://github.com/vllm-project/vllm/pull/50021)
+("[Bugfix] Bound accepted-token state lookups in GDN/KDA spec decode"). Without it,
+MTP speculative decode performs unbounded state reads in the GDN kernels and crashes the
+server. The full PR additionally hardens Kimi-K3/KDA and Mamba2 state-selection paths
+(`mamba_utils.py`) — not exercised by Qwen3.8, so it's not part of our validated subset.
+If the PR merges upstream, this patch becomes unnecessary on releases after that point.
 
 ## Quick start
 
@@ -51,8 +60,8 @@ uv pip install --python vllm_env vllm==0.27.1
 # 2. Apply the REQUIRED patch (unbounded GDN state reads under MTP = crash)
 #    https://github.com/vllm-project/vllm/pull/50021
 SITE=$(vllm_env/bin/python -c "import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))")
-(cd "$SITE" && patch -p1 --dry-run < /path/to/repo/patches/vllm-pr50021-wheel-only.patch)
-(cd "$SITE" && patch -p1 < /path/to/repo/patches/vllm-pr50021-wheel-only.patch)
+(cd "$SITE" && patch -p1 --dry-run < /path/to/repo/patches/vllm-pr50021-gdn-spec-bounds.patch)
+(cd "$SITE" && patch -p1 < /path/to/repo/patches/vllm-pr50021-gdn-spec-bounds.patch)
 
 # 3. Launch (pin the card by UUID if you have a mixed rig: nvidia-smi -L)
 CUDA_VISIBLE_DEVICES=GPU-<uuid> MODEL_PATH=/path/to/Qwen3.8-27B-Int8 API_KEY=secret \
