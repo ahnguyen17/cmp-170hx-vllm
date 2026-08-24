@@ -61,3 +61,43 @@ the complexity, with zero risk to a working prod server. Re-evaluate LMCache onl
 ## Probe
 
 `probes/prod-grown-prefix.py` — scenarios A/B/C above (argv: BASE KEY MODEL).
+
+---
+
+## UPDATE 2026-08-24: DEPLOYED TO PROD ✅
+
+**Option 1 built, verified, and promoted to the default path** (`55543a3`, `4b9c9a0`).
+
+### End-to-end A/B (final, through the proxy, word-shuffled virgin docs — `probes/booster-ab-test.py`)
+
+| | turn-2 TTFT (20K ctx, grown +2K) |
+|---|---|
+| X-Booster: off | 12.6 s |
+| booster on | **4.0 s (3.1×)** |
+
+Combined with the earlier direct measurements: follow-up turns now land in ~4–7 s instead of
+12–23 s, decaying toward the ~1.4–2.7 s warm-hit floor as the session grows.
+
+### Rollout state
+- `scripts/booster-proxy.py` — proxy :8013 → :8012; booster fires after each completed chat
+  gen (max_tokens=1 primer); cancels on real traffic; one-in-flight; >4K-token gate;
+  `X-Booster: off` escape hatch; per-request stage logging; fresh-connection-per-request.
+- `scripts/booster-watchdog.sh` — cron \*/5 restarts the proxy if it dies (gated on :8012 health).
+- `scripts/boot-recovery.sh` v6 — launches the proxy at boot alongside the engine.
+- Hermes `providers.uncensored-27b` + `deepseek-v4-flash` → `http://localhost:8013/v1`;
+  verified with the served alias `qwen3.6-27b-uncensored` (PROD-PATH-OK).
+- Stats: `curl :8013/booster/stats`.
+
+### Bugs found during verification (fixed, documented for posterity)
+1. **Qwen reasoning models reply in `reasoning`** until reasoning finishes (`content: None`)
+   — the boost gate originally required `message.content` and never fired at low max_tokens.
+   `extract_reply()` now falls back, and the boost fires even with no reply text (the
+   pre-reply prefix is the bulk of the next turn's shared prefix).
+2. One request hung with no forensics on the pooled-connection path → proxy now logs every
+   stage and uses `force_close` connections (stale keep-alive class eliminated).
+
+### Still open
+- Upstream #45238 comment (staged) — the 3-sighting align-cache behavior is the root cause;
+  this is a workaround, not a fix.
+- LMCache (Option 2) parked: revisit at 80K+ sessions or for cross-restart persistence.
+- `deepseek-v4-flash` provider model name 404s (stale alias, pre-existing, unrelated).
