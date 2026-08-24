@@ -14,6 +14,16 @@ Xid 79 falls-off-the-bus under sustained load. This recipe is validated on **Hyn
 prefix caching and MTP speculative decode coexist. The 0.27.1 recipe
 (`serve-qwen38-mtp.sh`) is retained as the conservative fallback.
 
+**2026-08-23 addendum** ([docs/gdn-prefix-caching-2026-08-23.md](docs/gdn-prefix-caching-2026-08-23.md)):
+root-caused the long-context misery — turn-2 prefix-cache miss is upstream
+[vllm#45238](https://github.com/vllm-project/vllm/issues/45238) (align-mode single-checkpoint
+retention; a prefix needs ~3 sightings before it hits). Added `--prefix-match-unit 400`
+(cached TTFT halved; unit must divide the 1600-token GDN block). Confirmed decode is
+69–79 tok/s — counting SSE deltas reads a false ~30 because MTP emits ~3.5 tok/delta.
+Do NOT raise `--max-num-batched-tokens` above 8192: GDN prefill intermediates scale with
+scheduled tokens — 32000 OOM'd in `chunk_fwd_o` and wedged the GA100 card (reboot-only).
+Probe scripts in `probes/`.
+
 ## Measured performance (single 170HX, Hynix, 64GB)
 
 Same-day A/B, same harness (300-token single-stream gens, 3-run medians):

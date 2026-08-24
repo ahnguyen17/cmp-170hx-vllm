@@ -16,6 +16,13 @@
 # With the default chunked-prefill batch size, prefix caching silently runs at 0.0% hit rate
 # (enabled but never matching): the mamba-align split logic needs single-shot prefills that
 # end exactly on the 1600-token hash boundary to register cacheable blocks. Measured both ways.
+# ALSO: do NOT raise the batched-tokens budget above 8192 — GDN prefill intermediates scale
+# with scheduled tokens; 32000 OOM'd in chunk_fwd_o and wedged the GA100 card (reboot-only).
+#
+# 2026-08-23: added --prefix-match-unit 400 — halves cached TTFT (partial-hit granularity).
+# The unit MUST divide the 1600-token GDN block (512 boot-fails with a clear ValueError).
+# Turn-2 cache miss remains: upstream vllm#45238 (align-mode single-checkpoint retention).
+# Full data: docs/gdn-prefix-caching-2026-08-23.md
 set -e
 
 # --- Card selection (CRITICAL in mixed rigs) -----------------------------------
@@ -39,6 +46,7 @@ exec vllm serve "$MODEL_PATH" \
   --kv-cache-dtype fp8_e4m3 \
   --mamba-ssm-cache-dtype auto \
   --enable-prefix-caching --enable-chunked-prefill \
+  --prefix-match-unit 400 \
   --async-scheduling --max-num-batched-tokens 8192 --max-num-scheduled-tokens 8192 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}' \
   --compilation-config '{"max_cudagraph_capture_size":128,"custom_ops":["+rms_norm","+silu_and_mul"]}' \
