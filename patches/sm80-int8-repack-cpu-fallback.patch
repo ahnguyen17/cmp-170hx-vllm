@@ -1,0 +1,95 @@
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -1080,6 +1080,80 @@
+ 
+ 
+ # gptq_marlin
++def _gptq_marlin_repack_torch(
++    b_q_weight: torch.Tensor,
++    perm: torch.Tensor,
++    size_k: int,
++    size_n: int,
++    num_bits: int,
++) -> torch.Tensor:
++    """Pure-PyTorch reimplementation of _C.gptq_marlin_repack for w4a16/w8a16.
++
++    The compiled kernel illegal-memory-accesses on sm80 in this build (see
++    syv-ai/qwen38-27b-rtx3090#27): w8 confirmed at target load; w4 fires in
++    the DFlash2 drafter load after a w8 target (Xid 31 GRAPHICS VIRT_WRITE,
++    surfaces at the next API call). This is a bit-exact layout transform
++    following marlin_utils_test.py's reference (marlin_permute_weights +
++    get_weight_perm + pack). One-time cost at weight load.
++    """
++    assert num_bits in (4, 8), "torch fallback written for num_bits in (4, 8)"
++    assert perm.numel() == 0, "fallback assumes desc_act=False (no perm)"
++    import os
++    import sys
++
++    _dbg = os.environ.get("SYV_DEBUG_REPACK") == "1"
++
++    def _mark(tag):
++        if _dbg:
++            torch.cuda.synchronize()
++            print(f"[repack] {tag}", file=sys.stderr, flush=True)
++
++    _mark(f"enter num_bits={num_bits} shape={tuple(b_q_weight.shape)}")
++    pack_factor = 32 // num_bits  # 8 (w4) / 4 (w8)
++    mask = (1 << num_bits) - 1  # 0xFF
++    packed_k, n = b_q_weight.shape
++    k = packed_k * pack_factor
++    assert (k, n) == (size_k, size_n), f"shape {(k, n)} != declared {(size_k, size_n)}"
++
++    dev = b_q_weight.device
++    # Compute on CPU: the ~GB-scale int64 intermediates churn sm80 VMM
++    # mappings under high device occupancy and trip Xid 31 REGION_VIOLATION
++    # (issue #27). Integer-only layout math — bit-exact on CPU, one H2D copy.
++    q = b_q_weight.to("cpu", dtype=torch.int64)  # [packed_k, n]
++    # Unpack: int32 row j holds k-rows j*pf .. j*pf+pf-1, LSB first.
++    q_w = torch.empty((k, n), dtype=torch.int64)
++    for i in range(pack_factor):
++        q_w[i::pack_factor, :] = (q >> (num_bits * i)) & mask
++    _mark("unpack done")
++
++    # Marlin 16x16 tile permutation (is_a_8bit=False layout).
++    tile = 16
++    q_w = (
++        q_w.reshape(k // tile, tile, n // tile, tile)
++        .permute(0, 2, 1, 3)
++        .reshape(k // tile, n * tile)
++    )
++    _mark("tile permute done")
++
++    # Fixed weight interleave (same table as the compiled kernel).
++    from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
++        get_weight_perm,
++    )
++
++    wperm = get_weight_perm(num_bits, is_a_8bit=False)
++    q_w = q_w.reshape(-1, wperm.numel())[:, wperm].reshape(k // tile, n * tile)
++    _mark("wperm gather done")
++
++    # Pack pack_factor consecutive columns per int32, LSB first.
++    out = torch.zeros((k // tile, (n * tile) // pack_factor), dtype=torch.int64)
++    for i in range(pack_factor):
++        out |= q_w[:, i::pack_factor] << (num_bits * i)
++    _mark("pack done")
++    r = out.to(torch.int32).to(dev, non_blocking=False)
++    _mark("cast+H2D done")
++    return r
++
++
+ def gptq_marlin_repack(
+     b_q_weight: torch.Tensor,
+     perm: torch.Tensor,
+@@ -1088,6 +1162,11 @@
+     num_bits: int,
+     is_a_8bit: bool = False,
+ ) -> torch.Tensor:
++    if num_bits in (4, 8) and not is_a_8bit and perm.numel() == 0:
++        # sm80 w4a16/w8a16 workaround: compiled repack IMAs (issue #27).
++        return _gptq_marlin_repack_torch(
++            b_q_weight, perm, size_k, size_n, num_bits
++        )
+     return torch.ops._C.gptq_marlin_repack(
+         b_q_weight, perm, size_k, size_n, num_bits, is_a_8bit
+     )

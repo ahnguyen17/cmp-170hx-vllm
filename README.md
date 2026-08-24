@@ -51,6 +51,11 @@ note-generation pipelines), cached TTFT drops **4.0 s → ~1.4 s** while decode 
 - `patches/vllm-pr50021-gdn-spec-bounds.patch` — required **only for 0.27.1** (GDN-relevant
   subset of [vllm-project/vllm#50021](https://github.com/vllm-project/vllm/pull/50021))
 - `patches/vllm-pr50021-full-pr.diff` — complete upstream PR diff for reference
+- `serve-g3-int8df2.sh` — **Samsung 40GB 170HX recipe**: int8 + DFlash2 drafter via the
+  0.27.1 fork (`SPEC=dflash2 CTX=fast`, port 18020)
+- `patches/sm80-int8-repack-cpu-fallback.patch` — **required for the DFlash2 recipe on
+  sm80/170HX**: CPU-side Marlin repack (bit-exact) to stop the Xid-31 wedge; also routes
+  W8A16 int8 target loads through the same safe path
 
 **Patch status on nightly:** NOT required — the nightly build's GDN rework ran hours of
 MTP spec decode (including k=7 stress) without the patch. Keep the patch around for 0.27.1
@@ -88,6 +93,45 @@ No patch step needed on the nightly build.
 | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | Prevents fragmentation OOM over long uptimes on HBM2e |
 | `CUDA_DEVICE_ORDER=PCI_BUS_ID` + UUID pin | In mixed rigs (e.g. 170HX beside GeForce cards) FASTEST_FIRST ordering will hand your server the wrong GPU |
 
+## int8 + DFlash2 on the 40GB Samsung (second 170HX)
+
+The Samsung-memory 170HX (40GB) that can't run the Hynix recipe still serves — with the
+DFlash2 block-drafting spec-decode head from the [qwen38-27b-rtx3090 fork](https://github.com/syv-ai/qwen38-27b-rtx3090)
+and an sm80-specific workaround. Validated Aug 23 2026, 512-token single-stream gens:
+
+| Metric | int8 + DFlash2 (this recipe) | int8 + MTP k=3 (same card) |
+|---|---|---|
+| Decode, single-stream | **97.8 tok/s** | 53.9 tok/s |
+| Aggregate, 8 concurrent streams | **275 tok/s** | — |
+| Draft acceptance | 2.9 – 3.1 | 2.7 – 3.0 |
+| Context | 64K (bf16 KV, FlashAttention) | 16K |
+| Boot time | ~7 min (CPU repack, one-time) | ~4 min |
+| Xid 31 wedges | 0 since fix (was: every boot) | — |
+
+### The sm80 Xid-31 bug and the workaround
+
+Loading W4A16/W8A16 Marlin weights on GA100 (sm80) wedges the card: Xid 31
+`FAULT_INFO_TYPE_REGION_VIOLATION … VIRT_WRITE` originating in `gptq_marlin_repack`
+traffic. The fault is asynchronous — the Python traceback points at a bystander frame
+(an `empty_cache`, a `.to()` cast), and the faulting VA drifts with allocation layout,
+so no single kernel ever looks guilty. Evidence chain: a bit-exact torch
+reimplementation of the repack runs clean on sm86 under `compute-sanitizer` (0 errors),
+and clean on sm80 at low occupancy — it faults only under production occupancy
+(~27GB resident). Root cause: the repack's GB-scale int64 intermediates churn VMM page
+mappings on sm80 until a mapping dies; the next kernel write faults. Fix: run the repack
+on CPU (pure integer layout math, bit-exact vs the compiled kernel on real weights) and
+copy the result back — one H2D per layer, ~3 extra minutes at boot, zero Xids since.
+
+Two things are mandatory on this card, and one is the opposite of the Hynix recipe:
+
+1. `patches/sm80-int8-repack-cpu-fallback.patch` — re-apply after every fork-venv rebuild:
+   `patch -d <venv>/lib/python3.12/site-packages -p1 < patches/sm80-int8-repack-cpu-fallback.patch`
+2. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` — an *independent* Xid-31 trigger
+   on this bin (Hynix wants `:True` for fragmentation; Samsung sm80 wedges with it).
+
+`serve-g3-int8df2.sh` wraps the fork's `single-user/start_qwen.sh`
+(`SPEC=dflash2 CTX=fast GPU_UTIL=0.96`, port 18020).
+
 ## Troubleshooting
 
 - **Prefix cache hit rate pinned at 0.0% despite `--enable-prefix-caching`** → you dropped
@@ -100,6 +144,12 @@ No patch step needed on the nightly build.
   (0.27.1 only) → the PR #50021 patch is not applied to the vLLM you're actually running.
 - **Xid 79 / card falls off the bus** → you are likely on a Samsung-memory 170HX. That
   variant needs kernel/driver workarounds outside this recipe's scope.
+- **Xid 31 / illegal memory access during model load on sm80 (170HX)**, traceback landing
+  in `gptq_marlin_repack` or a random nearby frame → the fault is asynchronous; **trust
+  the Xid, not the stack**. Apply `patches/sm80-int8-repack-cpu-fallback.patch` AND export
+  `expandable_segments:False`. See the Samsung recipe section above for the evidence chain.
+- **Card wedged after Xid 31 (every CUDA call hangs)** → warm host reboot is the only
+  recovery on 170HX. Probe pattern before relaunching: allocate 0.17/1/4 GB, then sync.
 - **OOM at load** → confirm `expandable_segments:True` is exported and lower
   `--gpu-memory-utilization` to 0.85.
 
