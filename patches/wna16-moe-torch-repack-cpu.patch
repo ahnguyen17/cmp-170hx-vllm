@@ -1,0 +1,9 @@
+Patch notes (not a git diff — apply manually to vllm/_custom_ops.py, see commit):
+- gptq_marlin_moe_repack + awq_marlin_moe_repack routed to
+  _gptq_marlin_repack_torch_moe: pure-torch CPU layout transform per expert
+  (unpack -> 16x16 tile permute -> get_weight_perm gather -> repack), single H2D.
+- Bit-exact vs _C kernels for num_bits=8 is_a_8bit=False (verified elementwise on
+  CMP 170HX sm_80). Model FlashNext-AWQ (w4, input_activations null => a8=False).
+- Motivation: compiled repack bursts wedge CMP 170HX GSP past ~40GB committed
+  (rate-of-page-population disease, see cmpunlocker-1 arena README); CPU path
+  removes the burst entirely.
